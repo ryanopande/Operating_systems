@@ -1,3 +1,5 @@
 *.o
 build/
 myshell/myshell
+test/hello
+test/hello.dSYM/
