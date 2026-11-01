@@ -1,5 +1,7 @@
 *.o
 build/
 myshell/myshell
-test/hello
-test/hello.dSYM/
+myshell/server
+myshell/client
+myshell/tests/hello
+myshell/tests/hello.dSYM/

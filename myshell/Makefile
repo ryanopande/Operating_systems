@@ -1,31 +1,38 @@
-# myshell build — gcc, one object per source, then link
+# myshell build — gcc, one object per source, then link (myshell, server, client)
 
 CC      = gcc
 CFLAGS  = -Wall -Wextra -g
 SRC     = src
 BUILD   = build
 TARGET  = myshell
-OBJS    = $(BUILD)/errors.o $(BUILD)/parser.o $(BUILD)/executor.o $(BUILD)/main.o
 
-all: $(TARGET) tests/hello
+# objects every program needs to parse and run a command line (Phase 1 engine)
+CORE_OBJS   = $(BUILD)/errors.o $(BUILD)/parser.o $(BUILD)/executor.o $(BUILD)/builtins.o
 
-# step 4: link
-$(TARGET): $(OBJS)
-	$(CC) $(OBJS) -o $@
+# phase 1: local shell
+SHELL_OBJS  = $(CORE_OBJS) $(BUILD)/lineio.o $(BUILD)/main.o
 
-# step 1: error helpers
-$(BUILD)/errors.o: $(SRC)/errors.c $(SRC)/errors.h | $(BUILD)
-	$(CC) $(CFLAGS) -c $< -o $@
+# phase 2: server (runs commands) and client (prompt + display)
+SERVER_OBJS = $(CORE_OBJS) $(BUILD)/net.o $(BUILD)/server.o
+CLIENT_OBJS = $(BUILD)/errors.o $(BUILD)/lineio.o $(BUILD)/net.o $(BUILD)/client.o
 
-# step 2: parser
-$(BUILD)/parser.o: $(SRC)/parser.c $(SRC)/parser.h $(SRC)/errors.h $(SRC)/shell.h | $(BUILD)
-	$(CC) $(CFLAGS) -c $< -o $@
+# every header; objects are rebuilt when any of them changes, which keeps the rules short
+HEADERS     = $(wildcard $(SRC)/*.h)
 
-# step 3: executor and main loop
-$(BUILD)/executor.o: $(SRC)/executor.c $(SRC)/executor.h $(SRC)/parser.h $(SRC)/errors.h $(SRC)/shell.h | $(BUILD)
-	$(CC) $(CFLAGS) -c $< -o $@
+all: $(TARGET) server client tests/hello
 
-$(BUILD)/main.o: $(SRC)/main.c $(SRC)/executor.h $(SRC)/parser.h $(SRC)/errors.h $(SRC)/shell.h | $(BUILD)
+# link step for each program
+$(TARGET): $(SHELL_OBJS)
+	$(CC) $(SHELL_OBJS) -o $@
+
+server: $(SERVER_OBJS)
+	$(CC) $(SERVER_OBJS) -o $@
+
+client: $(CLIENT_OBJS)
+	$(CC) $(CLIENT_OBJS) -o $@
+
+# compile step: one object per source file, shared by every program that uses it
+$(BUILD)/%.o: $(SRC)/%.c $(HEADERS) | $(BUILD)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD):
@@ -38,6 +45,6 @@ run: $(TARGET)
 	./$(TARGET)
 
 clean:
-	rm -rf $(BUILD) $(TARGET) tests/hello
+	rm -rf $(BUILD) $(TARGET) server client tests/hello
 
 .PHONY: all run clean
