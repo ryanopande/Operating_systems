@@ -6,11 +6,14 @@
 #include <stdio.h>
 #include <string.h>
 
-#include "errors.h"
-
 void shell_error(const char *message)
 {
     fprintf(stderr, "%s\n", message);
+}
+
+void shell_error_arg(const char *message, const char *name)
+{
+    fprintf(stderr, "%s: %s\n", message, name);
 }
 
 void shell_perror(const char *what)

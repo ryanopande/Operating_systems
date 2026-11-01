@@ -12,6 +12,9 @@
 // Maximum number of commands in one pipeline 
 #define MAX_CMDS 64
 
+// Maximum number of redirections (<, >, >>, 2>, 2>>) attached to one command
+#define MAX_REDIRS 16
+
 // The prompt shown before every line is read
 #define PROMPT "$ "
 

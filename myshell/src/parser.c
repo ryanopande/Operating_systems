@@ -145,25 +145,41 @@ static const char *missing_file_message(TokenType type)
     }
 }
 
-static void set_redirection(Command *cmd, TokenType type, char *file)
+// translate the tokenizer's operator token into the redirection type stored on a Command.
+static RedirType redir_type_of(TokenType type)
 {
-    // record a redirection on `cmd`.  if the same stream is redirected twice
-    // the last one wins, matching the behaviour of bash.
     switch (type) 
     {
     case TOK_IN:
-        cmd -> in_file = file;
-        break;
+        return REDIR_IN;
     case TOK_OUT:
+        return REDIR_OUT;
     case TOK_OUT_APPEND:
-        cmd -> out_file   = file;
-        cmd -> out_append = (type == TOK_OUT_APPEND);
-        break;
-    default: // TOK_ERR, TOK_ERR_APPEND 
-        cmd -> err_file   = file;
-        cmd -> err_append = (type == TOK_ERR_APPEND);
-        break;
+        return REDIR_OUT_APPEND;
+    case TOK_ERR:
+        return REDIR_ERR;
+    default: // TOK_ERR_APPEND
+        return REDIR_ERR_APPEND;
     }
+}
+
+// append a redirection to `cmd`. nothing is overwritten: a real shell opens every
+// redirection from left to right, so "echo A > first.txt > out.txt" must still create
+// first.txt and "cat < missing.txt < input.txt" must fail on missing.txt. the executor
+// replays this list in order, and for the same stream the last one wins automatically
+// because its dup2() happens last.
+static int add_redirection(Command *cmd, TokenType type, char *file)
+{
+    if (cmd -> number_of_redirs == MAX_REDIRS) 
+    {
+        shell_error("Too many redirections.");
+        return -1;
+    }
+
+    Redirect *redir = &cmd -> redirs[cmd -> number_of_redirs++];
+    redir -> type = redir_type_of(type);
+    redir -> file = file;
+    return 0;
 }
 
 int parse_line(const char *line, Pipeline *pl)
@@ -218,7 +234,8 @@ int parse_line(const char *line, Pipeline *pl)
                 shell_error(missing_file_message(tok -> type));
                 return PARSE_ERROR;
             }
-            set_redirection(cur, tok -> type, tokens[++i].text);
+            if (add_redirection(cur, tok -> type, tokens[++i].text) < 0)
+                return PARSE_ERROR;
             break;
         }
     }
