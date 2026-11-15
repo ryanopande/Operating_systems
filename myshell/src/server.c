@@ -1,11 +1,13 @@
-// server.c — Phase 2 server: accepts one client over TCP, runs every command it sends
-// with the Phase 1 shell engine (parser + executor) and sends the output back.
+// server.c — Phase 3 server: accepts many clients over TCP at the same time, one thread per
+// client. each thread runs that client's commands with the Phase 1 shell engine (parser +
+// executor) and sends the output back. "exit" or a disconnect ends only that client.
 
 
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdint.h>
@@ -27,22 +29,38 @@
 // text appended to a reply that had to be cut at MAX_MESSAGE bytes
 #define TRUNCATION_NOTICE "\n[output truncated]\n"
 
+// one per connected client: allocated by main, freed by the client's own thread
+typedef struct ClientInfo
+{
+    int  fd;
+    int  id;
+    char ip[INET_ADDRSTRLEN];
+    int  port;
+} ClientInfo;
+
 // ---------------------------------------------------------------------------
 // logging
 
+// held while printing, so the text of two clients never mixes inside one line
+static pthread_mutex_t log_lock = PTHREAD_MUTEX_INITIALIZER;
 
-// print one "[TAG] message" line and flush it right away so the log stays in step
-// with what happens even when the server's output is piped into a file.
-static void log_line(const char *tag, const char *format, ...)
+// print one "[TAG] [Client #N - ip:port] message" line and flush it right away so the log
+// stays in step with what happens even when the server's output is piped into a file.
+// ci is NULL for lines about the server itself. a message ending in "\n" leaves a blank line.
+static void log_line(const ClientInfo *ci, const char *tag, const char *format, ...)
 {
     va_list args;
 
+    pthread_mutex_lock(&log_lock);
     printf("[%s] ", tag);
+    if (ci != NULL)
+        printf("[Client #%d - %s:%d] ", ci->id, ci->ip, ci->port);
     va_start(args, format);
     vprintf(format, args);
     va_end(args);
     putchar('\n');
     fflush(stdout);
+    pthread_mutex_unlock(&log_lock);
 }
 
 // ---------------------------------------------------------------------------
@@ -64,6 +82,7 @@ enum
 // pipe holds only ~64 KiB, so a command printing more than that would block forever while
 // the server waits for it to finish. stdin goes to /dev/null so a command such as a bare
 // "cat" ends immediately instead of waiting for input on the server's terminal.
+// a runner is needed because all threads share the server's descriptors.
 static void run_in_child(const char *line, FILE *capture)
 {
     Pipeline pipeline;
@@ -182,68 +201,65 @@ static char *trimmed_copy(const char *text, size_t len)
 
 // log a failed command the way the assignment figure shows it: the program name in
 // "Command not found: name" is quoted, any other message is printed unchanged.
-static void log_error_message(const char *message)
+static void log_error_message(const ClientInfo *ci, const char *message)
 {
     static const char prefix[] = "Command not found: ";
 
     if (strncmp(message, prefix, sizeof prefix - 1) == 0)
-        log_line("ERROR", "Command not found: \"%s\"", message + sizeof prefix - 1);
+        log_line(ci, "ERROR", "Command not found: \"%s\"", message + sizeof prefix - 1);
     else
-        log_line("ERROR", "%s", message);
+        log_line(ci, "ERROR", "%s", message);
 }
 
-// show the reply on the server console. a normal reply is printed as is, directly
-// followed by the next log line (like the figure); a failure is logged as [ERROR] and the exact text that
-// goes to the client is shown on one line.
-static void log_reply(const char *output, size_t len, int failed)
+// show the reply on the server console. a normal reply is printed as is, in the same
+// log_line call as its [OUTPUT] line so no other client's line lands in the middle of it;
+// a failure is logged as [ERROR] and the exact text that goes to the client is shown on one line.
+static void log_reply(const ClientInfo *ci, const char *output, size_t len, int failed)
 {
     if (failed) {
         char *message = trimmed_copy(output, len);
         if (message == NULL)
             return;
-        log_error_message(message);
-        log_line("OUTPUT", "Sending error message to client: \"%s\"", message);
+        log_error_message(ci, message);
+        log_line(ci, "OUTPUT", "Sending error message to client: \"%s\"\n", message);
         free(message);
         return;
     }
 
     if (len == 0) {
-        log_line("OUTPUT", "Command produced no output.");
+        log_line(ci, "OUTPUT", "Command produced no output.\n");
         return;
     }
 
-    log_line("OUTPUT", "Sending output to client:");
-    fputs(output, stdout);
-    if (output[len - 1] != '\n')
-        fputc('\n', stdout);
-    fflush(stdout);
+    log_line(ci, "OUTPUT", "Sending output to client:\n%s", output);
 }
 
 // what handle_command decided about the connection
 enum
 {
     SERVE_CONTINUE = 0,  // keep reading commands
-    SERVE_STOP     = 1   // exit requested or the client is gone: shut down
+    SERVE_STOP     = 1   // exit requested or the client is gone: end this session
 };
 
-// run one command line through the Phase 1 parser and executor in a runner process, and
-// send the text it printed back to the client.
-static int handle_command(int client_fd, const char *line)
+// run one command line for one client through the Phase 1 parser and executor in a runner
+// process, and send the text it printed back to that client.
+static int handle_command(const ClientInfo *ci, const char *line)
 {
     char  *output;
     size_t len;
 
     int code = run_command(line, &output, &len);
     if (code < 0) {
-        log_line("ERROR", "Could not run command: %s", strerror(errno));
+        log_line(ci, "ERROR", "Could not run command: %s", strerror(errno));
         static const char reply[] = "Server error: cannot run command.\n";
-        return send_message(client_fd, reply, sizeof reply - 1) < 0
+        return send_message(ci->fd, reply, sizeof reply - 1) < 0
                ? SERVE_STOP : SERVE_CONTINUE;
     }
 
+    // "exit" ends only this client's session, nothing is sent back
     if (code == RUN_EXIT) {
         free(output);
-        log_line("INFO", "Exit command received, shutting down.");
+        log_line(ci, "INFO", "Client requested disconnect. Closing connection.");
         return SERVE_STOP;
     }
 
@@ -263,43 +279,60 @@ static int handle_command(int client_fd, const char *line)
 
     // only a line that reached the executor counts as executed
     if (code != RUN_EMPTY && code != RUN_PARSE_ERROR)
-        log_line("EXECUTING", "Executing command: \"%s\"", line);
+        log_line(ci, "EXECUTING", "Executing command: \"%s\"", line);
     if (code != RUN_EMPTY)
-        log_reply(output, len, failed);
+        log_reply(ci, output, len, failed);
 
-    int sent = send_message(client_fd, output, len);
+    int sent = send_message(ci->fd, output, len);
     free(output);
     if (sent < 0) {
-        log_line("ERROR", "Could not send reply to client: %s", strerror(errno));
+        log_line(ci, "ERROR", "Could not send reply to client: %s", strerror(errno));
         return SERVE_STOP;
     }
     return SERVE_CONTINUE;
 }
 
 // receive commands from the connected client until it disconnects or asks to exit.
-static void serve_client(int client_fd)
+static void serve_client(const ClientInfo *ci)
 {
     for (;;) {
         char  *command;
         size_t len;
 
         // commands are bounded by the shell's own line limit
-        int status = recv_message(client_fd, &command, &len, MAX_LINE - 1);
+        int status = recv_message(ci->fd, &command, &len, MAX_LINE - 1);
         if (status == 0) {
-            log_line("INFO", "Client disconnected.");
+            log_line(ci, "INFO", "Client closed the connection.");
             return;
         }
         if (status < 0) {
-            log_line("ERROR", "Could not receive command: %s", strerror(errno));
+            log_line(ci, "ERROR", "Could not receive command: %s", strerror(errno));
             return;
         }
 
-        log_line("RECEIVED", "Received command: \"%s\" from client.", command);
-        int next = handle_command(client_fd, command);
+        log_line(ci, "RECEIVED", "Received command: \"%s\"", command);
+        int next = handle_command(ci, command);
         free(command);
         if (next == SERVE_STOP)
             return;
     }
+}
+
+// start function of every client thread: serve the client, then free its ClientInfo.
+// the thread is detached, so nobody joins it.
+static void *client_thread(void *arg)
+{
+    ClientInfo *ci = arg;
+
+    serve_client(ci);
+
+    // a runner started for another client may still hold a copy of this socket, so close()
+    // alone would not end the connection. shutdown() does, and the client sees it at once.
+    shutdown(ci->fd, SHUT_RDWR);
+    close(ci->fd);
+    log_line(NULL, "INFO", "Client #%d disconnected.", ci->id);
+    free(ci);
+    return NULL;
 }
 
 // ---------------------------------------------------------------------------
@@ -346,8 +379,8 @@ static int create_listener(int port)
         return -1;
     }
 
-    // backlog of 1: this phase serves a single client
-    if (listen(fd, 1) < 0) {
+    // several clients connect at once, so queue as many as the system allows
+    if (listen(fd, SOMAXCONN) < 0) {
         shell_perror("listen");
         close(fd);
         return -1;
@@ -376,24 +409,41 @@ int main(int argc, char *argv[])
     if (listen_fd < 0)
         return EXIT_FAILURE;
 
-    log_line("INFO", "Server started, waiting for client connections...");
+    log_line(NULL, "INFO", "Server started, waiting for client connections...");
 
-    int client_fd;
-    do {
-        client_fd = accept(listen_fd, NULL, NULL);
-    } while (client_fd < 0 && errno == EINTR);
+    // runs until the process is killed (Ctrl-C). only this thread changes next_id.
+    int next_id = 0;
+    for (;;) {
+        struct sockaddr_in peer;
+        socklen_t          peer_len = sizeof peer;
 
-    // only one client is served, so the listening socket is no longer needed
-    close(listen_fd);
-    if (client_fd < 0) {
-        shell_perror("accept");
-        return EXIT_FAILURE;
+        int client_fd = accept(listen_fd, (struct sockaddr *)&peer, &peer_len);
+        if (client_fd < 0) {
+            log_line(NULL, "ERROR", "accept failed: %s", strerror(errno));
+            continue;
+        }
+
+        ClientInfo *ci = malloc(sizeof *ci);
+        if (ci == NULL) {
+            log_line(NULL, "ERROR", "Out of memory, connection dropped.");
+            close(client_fd);
+            continue;
+        }
+        ci->fd   = client_fd;
+        ci->id   = ++next_id;
+        ci->port = ntohs(peer.sin_port);
+        inet_ntop(AF_INET, &peer.sin_addr, ci->ip, sizeof ci->ip);
+
+        log_line(NULL, "INFO", "Client #%d connected from %s:%d. Assigned to Thread-%d.",
+                 ci->id, ci->ip, ci->port, ci->id);
+
+        pthread_t thread;
+        if (pthread_create(&thread, NULL, client_thread, ci) != 0) {
+            log_line(NULL, "ERROR", "Could not create a thread for client #%d.", ci->id);
+            close(client_fd);
+            free(ci);
+            continue;
+        }
+        pthread_detach(thread);
     }
-
-    log_line("INFO", "Client connected.");
-    serve_client(client_fd);
-
-    close(client_fd);
-    log_line("INFO", "Server shut down.");
-    return EXIT_SUCCESS;
 }
