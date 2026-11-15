@@ -14,6 +14,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include "builtins.h"
@@ -30,109 +31,74 @@
 // logging
 
 
-// while a command runs, the server's own stdout is pointed at the capture file, so the
-// log lines are written through this separate diplicate of the real terminal instead.
-static FILE *log_stream;
-
-// open the log stream on a private copy of the terminal's stdout. the copy is marked
-// close-on-exec so the programs we run do not inherit it.
-static int log_open(void)
-{
-    int fd = fcntl(STDOUT_FILENO, F_DUPFD_CLOEXEC, 3);
-    if (fd < 0)
-        return -1;
-
-    log_stream = fdopen(fd, "w");
-    if (log_stream == NULL) {
-        close(fd);
-        return -1;
-    }
-    return 0;
-}
-
 // print one "[TAG] message" line and flush it right away so the log stays in step
 // with what happens even when the server's output is piped into a file.
 static void log_line(const char *tag, const char *format, ...)
 {
     va_list args;
 
-    fprintf(log_stream, "[%s] ", tag);
+    printf("[%s] ", tag);
     va_start(args, format);
-    vfprintf(log_stream, format, args);
+    vprintf(format, args);
     va_end(args);
-    fputc('\n', log_stream);
-    fflush(log_stream);
+    putchar('\n');
+    fflush(stdout);
 }
 
 // ---------------------------------------------------------------------------
 // output capture
 
-// state needed to put stdin/stdout/stderr back after a capture.
-typedef struct Capture 
+// what the runner process tells the server through its exit status
+enum
 {
-    FILE *file;      // temporary file that receives everything the command prints
-    int   saved[3];  // copies of the original descriptors 0, 1 and 2
-} Capture;
+    RUN_OK           = 0,
+    RUN_FAILED       = 1,
+    RUN_PARSE_ERROR  = 2,
+    RUN_START_FAILED = 3,
+    RUN_EXIT         = 4,
+    RUN_EMPTY        = 5
+};
 
-// duplicate `fd` into a descriptor above 2 that is closed automatically on exec.
-static int save_fd(int fd)
+// body of the forked runner process, it never returns. it points stdout and stderr at the
+// temporary file and stdin at /dev/null. a file is used instead of a pipe on purpose: a
+// pipe holds only ~64 KiB, so a command printing more than that would block forever while
+// the server waits for it to finish. stdin goes to /dev/null so a command such as a bare
+// "cat" ends immediately instead of waiting for input on the server's terminal.
+static void run_in_child(const char *line, FILE *capture)
 {
-    return fcntl(fd, F_DUPFD_CLOEXEC, 3);
-}
-
-// point stdout and stderr at a temporary file and stdin at /dev/null. a file is used
-// instead of a pipe on purpose: a pipe holds only ~64 KiB, so a command printing more
-// than that would block forever while the server waits for it to finish. stdin goes to
-// /dev/null so a command such as a bare "cat" ends immediately instead of waiting for
-// input on the server's terminal.
-static int capture_begin(Capture *cap)
-{
-    fflush(stdout);
-    fflush(stderr);
-
-    cap->file = tmpfile();
-    if (cap->file == NULL) {
-        shell_perror("tmpfile");
-        return -1;
-    }
-
-    for (int i = 0; i < 3; i++) {
-        cap->saved[i] = save_fd(i);
-        if (cap->saved[i] < 0) {
-            shell_perror("dup");
-            fclose(cap->file);
-            for (int j = 0; j < i; j++)
-                close(cap->saved[j]);
-            return -1;
-        }
-    }
+    Pipeline pipeline;
 
     int null_fd = open("/dev/null", O_RDONLY);
-    int tmp_fd  = fileno(cap->file);
     if (null_fd >= 0) {
         dup2(null_fd, STDIN_FILENO);
         close(null_fd);
     }
-    dup2(tmp_fd, STDOUT_FILENO);
-    dup2(tmp_fd, STDERR_FILENO);
-    return 0;
+    dup2(fileno(capture), STDOUT_FILENO);
+    dup2(fileno(capture), STDERR_FILENO);
+
+    // parse errors are printed by parse_line() on stderr, so parsing happens inside
+    // the capture too: the client then receives them exactly like command output.
+    int parsed = parse_line(line, &pipeline);
+    if (parsed == PARSE_ERROR)
+        _exit(RUN_PARSE_ERROR);
+    if (parsed == PARSE_EMPTY)
+        _exit(RUN_EMPTY);
+    if (is_exit_command(&pipeline))
+        _exit(RUN_EXIT);
+
+    int status = execute_pipeline(&pipeline);
+    if (status < 0)
+        _exit(RUN_START_FAILED);
+    _exit(status != 0 ? RUN_FAILED : RUN_OK);
 }
 
-// restore the original descriptors and return everything captured as a malloc'd,
-// NUL-terminated string (*len is its length). returns NULL if memory ran out.
-static char *capture_end(Capture *cap, size_t *len)
+// return everything captured as a malloc'd, NUL-terminated string (*len is its length)
+// and close the file. returns NULL if memory ran out.
+static char *read_capture(FILE *file, size_t *len)
 {
-    fflush(stdout);
-    fflush(stderr);
-
-    for (int i = 0; i < 3; i++) {
-        dup2(cap->saved[i], i);
-        close(cap->saved[i]);
-    }
-
     // the child processes wrote through the shared file offset, so the end of the
     // file is also the size of the output.
-    int  fd   = fileno(cap->file);
+    int  fd   = fileno(file);
     off_t end = lseek(fd, 0, SEEK_END);
     size_t size = end < 0 ? 0 : (size_t)end;
     int truncated = size > MAX_MESSAGE;
@@ -159,8 +125,42 @@ static char *capture_end(Capture *cap, size_t *len)
         *len = got;
     }
 
-    fclose(cap->file);
+    fclose(file);
     return out;
+}
+
+// run `line` in a forked runner process and wait for it. returns the RUN_* code and the
+// captured output, or -1 when that was not possible.
+static int run_command(const char *line, char **output, size_t *len)
+{
+    FILE *capture = tmpfile();
+    if (capture == NULL)
+        return -1;
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        fclose(capture);
+        return -1;
+    }
+    if (pid == 0)
+        run_in_child(line, capture);
+
+    // wait for our own runner only: waiting for any child could take another client's
+    int wstatus;
+    if (waitpid(pid, &wstatus, 0) < 0) {
+        fclose(capture);
+        return -1;
+    }
+
+    // a runner killed by a signal never reached _exit()
+    int code = WIFEXITED(wstatus) ? WEXITSTATUS(wstatus) : RUN_START_FAILED;
+
+    *output = read_capture(capture, len);
+    if (*output == NULL) {
+        errno = ENOMEM;
+        return -1;
+    }
+    return code;
 }
 
 // ---------------------------------------------------------------------------
@@ -213,62 +213,45 @@ static void log_reply(const char *output, size_t len, int failed)
     }
 
     log_line("OUTPUT", "Sending output to client:");
-    fputs(output, log_stream);
+    fputs(output, stdout);
     if (output[len - 1] != '\n')
-        fputc('\n', log_stream);
-    fflush(log_stream);
+        fputc('\n', stdout);
+    fflush(stdout);
 }
 
 // what handle_command decided about the connection
-enum 
+enum
 {
     SERVE_CONTINUE = 0,  // keep reading commands
     SERVE_STOP     = 1   // exit requested or the client is gone: shut down
 };
 
-// run one command line through the Phase 1 parser and executor, capturing everything it
-// prints, and send that text back to the client.
+// run one command line through the Phase 1 parser and executor in a runner process, and
+// send the text it printed back to the client.
 static int handle_command(int client_fd, const char *line)
 {
-    static Pipeline pipeline;
-    Capture cap;
-    size_t  len = 0;
+    char  *output;
+    size_t len;
 
-    // parse errors are printed by parse_line() on stderr, so parsing happens inside
-    // the capture too: the client then receives them exactly like command output.
-    if (capture_begin(&cap) < 0) {
-        log_line("ERROR", "Could not set up output capture: %s", strerror(errno));
+    int code = run_command(line, &output, &len);
+    if (code < 0) {
+        log_line("ERROR", "Could not run command: %s", strerror(errno));
         static const char reply[] = "Server error: cannot run command.\n";
         return send_message(client_fd, reply, sizeof reply - 1) < 0
                ? SERVE_STOP : SERVE_CONTINUE;
     }
 
-    int parsed = parse_line(line, &pipeline);
-    int status = 0;
-
-    if (parsed == PARSE_OK && is_exit_command(&pipeline)) {
-        char *discard = capture_end(&cap, &len);
-        free(discard);
+    if (code == RUN_EXIT) {
+        free(output);
         log_line("INFO", "Exit command received, shutting down.");
-        return SERVE_STOP;
-    }
-
-    if (parsed == PARSE_OK) {
-        log_line("EXECUTING", "Executing command: \"%s\"", line);
-        status = execute_pipeline(&pipeline);
-    }
-
-    char *output = capture_end(&cap, &len);
-    if (output == NULL) {
-        log_line("ERROR", "Out of memory while collecting output.");
         return SERVE_STOP;
     }
 
     // a command counts as failrd when it could not be parsed or started, or when it
     // exited with an error status and printed something (that text is the error message).
     // a silent non-zero status such as "grep nomatch file" is not an error to report.
-    int failed = parsed == PARSE_ERROR || (parsed == PARSE_OK && status != 0 && len > 0)
-                 || (parsed == PARSE_OK && status < 0);
+    int failed = code == RUN_PARSE_ERROR || code == RUN_START_FAILED
+                 || (code == RUN_FAILED && len > 0);
 
     if (failed && len == 0) {
         free(output);
@@ -278,7 +261,10 @@ static int handle_command(int client_fd, const char *line)
         len = strlen(output);
     }
 
-    if (parsed != PARSE_EMPTY)
+    // only a line that reached the executor counts as executed
+    if (code != RUN_EMPTY && code != RUN_PARSE_ERROR)
+        log_line("EXECUTING", "Executing command: \"%s\"", line);
+    if (code != RUN_EMPTY)
         log_reply(output, len, failed);
 
     int sent = send_message(client_fd, output, len);
@@ -385,11 +371,6 @@ int main(int argc, char *argv[])
     // writing to a client that already left would otherwise kill the server with SIGPIPE;
     // ignoring it turns that into an ordinary send() error we can report.
     signal(SIGPIPE, SIG_IGN);
-
-    if (log_open() < 0) {
-        shell_perror("log");
-        return EXIT_FAILURE;
-    }
 
     int listen_fd = create_listener(port);
     if (listen_fd < 0)
