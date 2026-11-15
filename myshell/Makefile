@@ -1,7 +1,8 @@
 # myshell build — gcc, one object per source, then link (myshell, server, client)
 
 CC      = gcc
-CFLAGS  = -Wall -Wextra -g
+# -pthread is needed by the Phase 3 server (one thread per client), to compile and to link
+CFLAGS  = -Wall -Wextra -g -pthread
 SRC     = src
 BUILD   = build
 TARGET  = myshell
@@ -12,7 +13,7 @@ CORE_OBJS   = $(BUILD)/errors.o $(BUILD)/parser.o $(BUILD)/executor.o $(BUILD)/b
 # phase 1: local shell
 SHELL_OBJS  = $(CORE_OBJS) $(BUILD)/lineio.o $(BUILD)/main.o
 
-# phase 2: server (runs commands) and client (prompt + display)
+# phase 2/3: server (one thread per client, runs commands) and client (prompt + display)
 SERVER_OBJS = $(CORE_OBJS) $(BUILD)/net.o $(BUILD)/server.o
 CLIENT_OBJS = $(BUILD)/errors.o $(BUILD)/lineio.o $(BUILD)/net.o $(BUILD)/client.o
 
@@ -26,7 +27,7 @@ $(TARGET): $(SHELL_OBJS)
 	$(CC) $(SHELL_OBJS) -o $@
 
 server: $(SERVER_OBJS)
-	$(CC) $(SERVER_OBJS) -o $@
+	$(CC) $(SERVER_OBJS) -pthread -o $@
 
 client: $(CLIENT_OBJS)
 	$(CC) $(CLIENT_OBJS) -o $@

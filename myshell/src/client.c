@@ -1,5 +1,6 @@
-// client.c — Phase 2 client: shows a "$" prompt, sends every command to the server over
-// TCP and prints whatever the server sends back.
+// client.c — Phase 3 client: shows a "$" prompt, sends every command to the server over
+// TCP and prints whatever the server sends back. "exit" or end of input (Ctrl-D) ends
+// only this client; the server keeps running for the others.
 
 #include <ctype.h>
 #include <errno.h>
@@ -94,9 +95,11 @@ int main(int argc, char *argv[])
         fputs(PROMPT, stdout);
         fflush(stdout);
 
-        // end of input(Ctrl-D) closing the socket,server the client is gone, and server shuts down.
+        // end of input (Ctrl-D): closing the socket tells the server this client is gone,
+        // so it ends only this client's session.
         if (!read_line(line, sizeof line)) {
             putchar('\n');
+            puts("Disconnected from server.");
             break;
         }
         if (is_blank(line))
@@ -112,10 +115,12 @@ int main(int argc, char *argv[])
         size_t len;
         int    got = recv_message(fd, &reply, &len, MAX_MESSAGE);
 
-        // the server answers "exit" by shutting down without a reply, so a closed
-        // connection right after an exit command is the normal way to finish.
+        // the server answers "exit" by closing this client's connection without a reply,
+        // so a closed connection right after an exit command is the normal way to finish.
         if (got == 0) {
-            if (!is_exit_line(line)) {
+            if (is_exit_line(line)) {
+                puts("Disconnected from server.");
+            } else {
                 shell_error("Server closed the connection.");
                 status = EXIT_FAILURE;
             }
