@@ -1,6 +1,6 @@
 #!/bin/sh
-# run_tests.sh — automated checks for the Phase 1 feedback fixes and the Phase 2
-# client/server. run from the myshell directory after "make":  sh tests/run_tests.sh
+# run_tests.sh — automated checks for the Phase 1 feedback fixes and the Phase 3
+# multithreaded client/server. run from the myshell directory after "make":  sh tests/run_tests.sh
 
 ROOT=$(pwd)
 WORK=$(mktemp -d)
@@ -55,10 +55,15 @@ SH
 check "cat > first.txt < missing.txt reports the error" "$(printf '$ File not found.\n$ ')" "$out"
 check "...but still creates first.txt first"            "yes" "$([ -f first.txt ] && echo yes)"
 
-# ---- Phase 2: client and server ----
+# ---- Phase 3: multithreaded client/server ----
+# helper: true when the server process is still alive
+alive() { kill -0 "$1" 2>/dev/null && echo yes || echo no; }
+
 "$ROOT/server" $PORT > server.log 2>&1 &
 SERVER_PID=$!
 sleep 1
+
+# one client sends exit: only its session ends
 printf 'echo hello\nunknowncmd\ncat < input.txt | sort | head -n 1\nexit\n' \
     | "$ROOT/client" 127.0.0.1 $PORT > client.log 2>&1
 sleep 1
@@ -66,26 +71,59 @@ sleep 1
 check "client shows command output"         "yes" "$(grep -q '^\$ hello$' client.log && echo yes)"
 check "client shows the not-found message"  "yes" "$(grep -q 'Command not found: unknowncmd' client.log && echo yes)"
 check "client shows a piped command result" "yes" "$(grep -q 'alpha' client.log && echo yes)"
-check "server logged the connection"        "yes" "$(grep -q '^\[INFO\] Client connected\.' server.log && echo yes)"
-check "server logged a received command"    "yes" "$(grep -q '^\[RECEIVED\] Received command: "echo hello" from client\.' server.log && echo yes)"
-check "server logged an error"              "yes" "$(grep -q '^\[ERROR\] Command not found: "unknowncmd"' server.log && echo yes)"
-if kill -0 $SERVER_PID 2>/dev/null; then
-    check "server shut down after exit" "stopped" "running"; kill $SERVER_PID
-else
-    check "server shut down after exit" "stopped" "stopped"
-fi
+check "client prints Disconnected after exit" "yes" "$(grep -q 'Disconnected from server\.' client.log && echo yes)"
+check "server logged client #1 connection"  "yes" "$(grep -q '^\[INFO\] Client #1 connected from 127\.0\.0\.1:[0-9]*\. Assigned to Thread-1\.' server.log && echo yes)"
+check "server logged a received command"    "yes" "$(grep -q '^\[RECEIVED\] \[Client #1 - 127\.0\.0\.1:[0-9]*\] Received command: "echo hello"' server.log && echo yes)"
+check "server logged executing"             "yes" "$(grep -q '^\[EXECUTING\] \[Client #1 - 127\.0\.0\.1:[0-9]*\] Executing command: "echo hello"' server.log && echo yes)"
+check "server logged an error"              "yes" "$(grep -q '^\[ERROR\] \[Client #1 - 127\.0\.0\.1:[0-9]*\] Command not found: "unknowncmd"' server.log && echo yes)"
+check "server logged the exit request"      "yes" "$(grep -q 'Client requested disconnect\. Closing connection\.' server.log && echo yes)"
+check "server logged Client #1 disconnected" "yes" "$(grep -q '^\[INFO\] Client #1 disconnected\.' server.log && echo yes)"
+check "server keeps running after exit"     "yes" "$(alive $SERVER_PID)"
 
-# the server must also stop when the client just disconnects (Ctrl-D / end of input)
-"$ROOT/server" $PORT > server2.log 2>&1 &
-SERVER_PID=$!
-sleep 1
+# a client that just disconnects (end of input, like Ctrl-D) also leaves the server up
 printf 'ls\n' | "$ROOT/client" 127.0.0.1 $PORT > /dev/null 2>&1
 sleep 1
-if kill -0 $SERVER_PID 2>/dev/null; then
-    check "server shut down after client disconnect" "stopped" "running"; kill $SERVER_PID
-else
-    check "server shut down after client disconnect" "stopped" "stopped"
-fi
+check "server logged plain disconnect"      "yes" "$(grep -q '^\[INFO\] Client #2 disconnected\.' server.log && echo yes)"
+check "server keeps running after Ctrl-D"   "yes" "$(alive $SERVER_PID)"
+
+# two clients at once: the slow one must not block the fast one
+( printf 'sleep 3\necho slow\n'; sleep 4 ) | "$ROOT/client" 127.0.0.1 $PORT > slow.log 2>&1 &
+SLOW_PID=$!
+sleep 1
+START=$(date +%s)
+printf 'echo fast\nexit\n' | "$ROOT/client" 127.0.0.1 $PORT > fast.log 2>&1
+ELAPSED=$(( $(date +%s) - START ))
+check "fast client is not blocked by slow client" "yes" "$([ $ELAPSED -lt 3 ] && echo yes)"
+check "fast client got its own output"            "yes" "$(grep -q '^\$ fast' fast.log && echo yes)"
+wait $SLOW_PID
+check "slow client still got its output"          "yes" "$(grep -q 'slow' slow.log && echo yes)"
+
+# a client that sends exit while another client's command is still running must be
+# disconnected at once, not when the other command ends
+( sleep 1; printf 'exit\n' ) | "$ROOT/client" 127.0.0.1 $PORT > exit_b.log 2>&1 &
+EXIT_B=$!
+sleep 0.3
+( printf 'sleep 3\n'; sleep 4 ) | "$ROOT/client" 127.0.0.1 $PORT > exit_a.log 2>&1 &
+EXIT_A=$!
+START=$(date +%s)
+wait $EXIT_B
+ELAPSED=$(( $(date +%s) - START ))
+check "exit is not delayed by another client's running command" "yes" "$([ $ELAPSED -lt 3 ] && echo yes)"
+wait $EXIT_A
+
+# three clients in parallel: every client gets only its own output
+PAR_PIDS=""
+for n in A B C; do
+    ( printf "echo token_$n\n"; sleep 1; printf 'exit\n' ) | "$ROOT/client" 127.0.0.1 $PORT > par_$n.log 2>&1 &
+    PAR_PIDS="$PAR_PIDS $!"
+done
+wait $PAR_PIDS   # wait for the clients only, not for the server
+for n in A B C; do
+    check "client $n received token_$n"   "yes" "$(grep -q "token_$n" par_$n.log && echo yes)"
+done
+check "no output crossed between clients" "3" "$(cat par_A.log par_B.log par_C.log | grep -c 'token_')"
+check "server still running after 3 clients" "yes" "$(alive $SERVER_PID)"
+kill $SERVER_PID 2>/dev/null; wait $SERVER_PID 2>/dev/null
 
 cd "$ROOT" && rm -rf "$WORK"
 echo; echo "$PASS passed, $FAIL failed"
